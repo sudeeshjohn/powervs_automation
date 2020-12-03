@@ -101,7 +101,7 @@ function error {
 }
 function debug_switch {
   if [[ $TRACE == 0 ]]; then
-    return
+    return 0
   fi
 
   if [[ $- =~ x ]]; then
@@ -117,7 +117,7 @@ function debug_switch {
 function output {
   cd ./"$ARTIFACTS_DIR"
   TF="../$TF"
-  $TF output $output_var
+  $TF output "$output_var"
 }
 
 #-------------------------------------------------------------------------
@@ -145,44 +145,178 @@ function retry {
 #-------------------------------------------------------------------------
 function show_progress {
   if [[ "$TF_TRACE" -eq 1 ]]; then
-    return
+    return 0
   fi
   str="-"
-  for ((n=0;n<$PERCENT;n+=2)); do str="${str}#"; done
-  for ((n=$PERCENT;n<=100;n+=2)); do str="${str} "; done
+  for ((n=0;n<PERCENT;n+=2)); do str="${str}#"; done
+  for ((n=PERCENT;n<=100;n+=2)); do str="${str} "; done
   echo -ne "$str($PERCENT%)\r"
+}
+
+#-------------------------------------------------------------------------
+# Check if ping to an IP is working
+#-------------------------------------------------------------------------
+function check_ping {
+  [[ -z $1 ]] && return 1
+  $BASTION_SSH_CMD ping -w 2 -c 1 "$1" &>/dev/null
+}
+
+#-------------------------------------------------------------------------
+# Check if resource state exist
+#-------------------------------------------------------------------------
+function checkState {
+  if ! $TF state list 2>/dev/null | grep -F "$1" >/dev/null 2>&1 || $TF state show "$1" 2>/dev/null | grep "(tainted)" >/dev/null; then
+    return 1;
+  fi
+}
+
+#-------------------------------------------------------------------------
+# Check if resource state exist
+#-------------------------------------------------------------------------
+function checkOutput {
+  $TF output | grep -F "$1" >/dev/null 2>&1
+}
+
+#-------------------------------------------------------------------------
+# Check if cluster nodes resources are created
+#-------------------------------------------------------------------------
+function checkAllNodes {
+  no_of_nodes=$($TF state list 2>/dev/null | grep "module.nodes.ibm_pi_instance" | wc -l)
+  if [[ $no_of_nodes -eq 0 ]]; then
+    return 1
+  fi
+  if [[ $no_of_nodes -eq $TOTAL_RHCOS ]]; then
+    PERCENT=65
+  else
+    current_percent=$(( 50  * no_of_nodes / TOTAL_RHCOS))
+    PERCENT=$(( 14 + current_percent ))
+  fi
+}
+
+#-------------------------------------------------------------------------
+# Reboot node if ELAPSED_TIME is greater than TIMEOUT
+#-------------------------------------------------------------------------
+function reboot_node {
+  TIMEOUT=25
+  NODE=$1
+  if [[ -z $ELAPSED_TIME ]]; then
+    ELAPSED_TIME=$SECONDS
+  elif [[ $((SECONDS - ELAPSED_TIME)) -gt $(($TIMEOUT * 60)) ]]; then
+    warn "Unable to connect to $NODE. Rebooting the node"
+    $CLI_PATH pi instance-hard-reboot "$NODE"
+    ELAPSED_TIME=$SECONDS
+  fi
+}
+
+#-------------------------------------------------------------------------
+# Check if the infra setup is working
+#-------------------------------------------------------------------------
+function checkClusterSetup {
+  # Check if every node has an IP
+  if ! checkOutput "bastion_ssh_command" || ! checkOutput "bootstrap_ip" || ! checkOutput "master_ips" || ! checkOutput "worker_ips"; then
+    return 1
+  fi
+
+  BASTION_SSH_CMD="$($TF output bastion_ssh_command | sed 's/,.*//') -q -o StrictHostKeyChecking=no"
+
+  # Check if ign file is available for download
+  ign_url="http://$CLUSTER_ID-bastion-0:8080/ignition/bootstrap.ign"
+  if [[ $PERCENT -lt 71 ]]; then
+    if $BASTION_SSH_CMD curl -s --head "$ign_url" | grep "200 OK" > /dev/null; then
+      PERCENT=71
+    else
+      return 1
+    fi
+  fi
+
+  # Check bootstrap connection
+  if [[ $PERCENT -lt 72 ]]; then
+    if grep -F "ok: [bootstrap] => {\"changed\"" $LOG_FILE > /dev/null; then
+      PERCENT=72
+      unset ELAPSED_TIME
+    else
+      reboot_node "$CLUSTER_ID-bootstrap"
+      return 0
+    fi
+  fi
+
+  # Check masters connection
+  for ((i=0;i<MASTER_COUNT;i++)); do
+    if [[ $PERCENT -lt $((73 + i)) ]]; then
+      if grep -F "ok: [master-$i] => {\"changed\"" $LOG_FILE > /dev/null; then
+        PERCENT=$((73 + i))
+        unset ELAPSED_TIME
+      else
+        reboot_node "$CLUSTER_ID-master-$i"
+        return 0
+      fi
+    fi
+  done
+
+  # Check wait-for-bootstrap completion
+  # Implies that wait-for-bootstrap is complete when compute node check has started
+  if [[ $PERCENT -lt 82 ]] && grep -F "module.install.null_resource.install (remote-exec): PLAY [Check and configure compute nodes]" "$LOG_FILE" >/dev/null; then
+    PERCENT=82
+  fi
+
+  # Check workers connection
+  for ((i=0;i<WORKER_COUNT;i++)); do
+    if [[ $PERCENT -lt $((83 + i)) ]]; then
+      if grep -F "ok: [worker-$i] => {\"changed\"" $LOG_FILE > /dev/null; then
+        PERCENT=$((83 + i))
+        unset ELAPSED_TIME
+      else
+        reboot_node "$CLUSTER_ID-worker-$i"
+        return 0
+      fi
+    fi
+  done
+  # TODO: Check wait-for-complete
 }
 
 #-------------------------------------------------------------------------
 # Evaluate the progress
 #-------------------------------------------------------------------------
 function monitor {
-  [ "$PERCENT" -eq 0 ] && [[ $($TF output "cluster_id" 2>/dev/null) ]] && CLUSTER_ID=$($TF output "cluster_id") && PERCENT=1
-  [ "$PERCENT" -lt 2 ] && [[ $($TF state show "module.prepare.ibm_pi_key.key" 2>/dev/null) ]] && PERCENT=2
-  [ "$PERCENT" -lt 3 ] && [[ $($TF state show "module.prepare.ibm_pi_network.public_network" 2>/dev/null) ]] && PERCENT=3 && SLEEP_TIME=30
-  [ "$PERCENT" -lt 10 ] && [[ $($TF state show "module.prepare.ibm_pi_instance.bastion[0]" 2>/dev/null) ]] && PERCENT=10
-  [ "$PERCENT" -lt 12 ] && [[ $($TF state show "module.prepare.null_resource.bastion_init[0]" 2>/dev/null) ]] && PERCENT=12
-  [ "$PERCENT" -lt 14 ] && [[ $($TF state show "module.prepare.null_resource.bastion_packages[0]" 2>/dev/null) ]] && PERCENT=14
-  no_of_nodes=$($TF state list 2>/dev/null | grep "module.nodes.ibm_pi_instance" | wc -l)
-  [[ $no_of_nodes -eq $TOTAL_RHCOS ]]&& PERCENT=65
-  if [ "$PERCENT" -lt 65 ] && [[ $no_of_nodes -ne 0 ]]; then
-      current_percent=$(( 50 / $TOTAL_RHCOS * $no_of_nodes ))
-      PERCENT=$(( 14 + $current_percent ))
+  if checkOutput "cluster_id"; then
+    CLUSTER_ID=$($TF output "cluster_id" 2>/dev/null)
+  else
+    PERCENT=0
+    return 0
   fi
-  [ "$PERCENT" -lt 74 ] && [[ $($TF state show "module.install.null_resource.config" 2>/dev/null) ]] && PERCENT=74
-  [ "$PERCENT" -lt 98 ] && [[ $($TF state show "module.install.null_resource.install" 2>/dev/null) ]] && PERCENT=98
 
-  show_progress
+  if grep -F "module.install.null_resource.install: Creation complete after" "$LOG_FILE" >/dev/null; then
+    PERCENT=99
+  elif checkClusterSetup; then
+    return 0
+  elif checkState "module.install.null_resource.config"; then
+    PERCENT=70
+  elif checkAllNodes; then
+    return 0
+  elif checkState "module.prepare.null_resource.bastion_packages[0]"; then
+    PERCENT=14
+  elif checkState "module.prepare.null_resource.bastion_init[0]"; then
+    PERCENT=12
+  elif checkState "module.prepare.ibm_pi_instance.bastion[0]"; then
+    PERCENT=10
+  elif checkState "module.prepare.ibm_pi_network.public_network"; then
+    PERCENT=3
+  elif checkState "module.prepare.ibm_pi_key.key"; then
+    PERCENT=2
+  else
+    PERCENT=1
+  fi
 }
 
 #-------------------------------------------------------------------------
 # Monitor loop for the progress of apply command
 #-------------------------------------------------------------------------
 function monitor_loop {
-  # Wait if log file is updated in last 30s
-  while [[ $(find ${LOG_FILE} -mmin -0.5 -print) ]]; do
+  # Wait if log file is updated in last 1m
+  while [[ $(find "${LOG_FILE}" -mmin -1 -print) ]]; do
     if [[ $action == "apply" ]]; then
       monitor
+      show_progress
     fi
     sleep $SLEEP_TIME
   done
@@ -193,31 +327,37 @@ function monitor_loop {
 #-------------------------------------------------------------------------
 function plan_info {
   BASTION_COUNT=$(grep ibm_pi_instance.bastion tfplan | wc -l)
-  BOOTSTRAP_COUNT=1
+  BOOTSTRAP_COUNT=$(grep ibm_pi_instance.bootstrap tfplan | wc -l)
   MASTER_COUNT=$(grep ibm_pi_instance.master tfplan | wc -l)
   WORKER_COUNT=$(grep ibm_pi_instance.worker tfplan | wc -l)
-  TOTAL_RHCOS=$(( $BOOTSTRAP_COUNT + $MASTER_COUNT + $WORKER_COUNT ))
+  TOTAL_RHCOS=$(( BOOTSTRAP_COUNT + MASTER_COUNT + WORKER_COUNT ))
 }
 
 #-------------------------------------------------------------------------
 # # Check if terraform is already running
 #-------------------------------------------------------------------------
 function is_terraform_running {
-  LOG_FILE="../logs/$(ls -Art ../logs | tail -n 1)"
-  if [[ ! $(find ${LOG_FILE} -mmin -0.5 -print) ]] || [[ "$LOG_FILE" == "../logs/" ]]; then
+  LOG_FILE=$(ls -Art ../logs | tail -n 1)
+  [[ -z $LOG_FILE ]] && return 0
+  LOG_FILE="../logs/$LOG_FILE"
+
+  if [[ -n $(find ${LOG_FILE} -mmin -1 -print) ]]; then
+    warn "Last run was less than a min ago... please wait"
+    sleep 60
+  else
+    return 0
+  fi
+  if [[ -n $(find ${LOG_FILE} -mmin -1 -print) ]]; then
+    warn "Existing Terraform process is already running... please wait"
+    plan_info
+    monitor_loop
+    log "Starting a new terraform process... please wait"
+  else
     # No log files updated in last 30s; Invalid TF lock file
     if [[ ! -f ./.terraform.tfstate.lock.info ]]; then
       rm -f ./.terraform.tfstate.lock.info
     fi
-    return
   fi
-
-  warn "Terraform process is already running... please wait"
-
-  plan_info
-  monitor_loop
-
-  log "Starting a new terraform process... please wait"
 }
 
 #-------------------------------------------------------------------------
@@ -228,14 +368,10 @@ function delete_failed_instance {
   COUNT=$2
   n=0
   while [[ "$n" -lt $COUNT ]]; do
-    if [[ ! $($TF state list | grep "module.nodes.ibm_pi_instance.$NODE\[$n\]") ]]; then
-      instance_name="$CLUSTER_ID-$NODE"
-      [[ $COUNT -gt 1 ]] && instance_name="$instance_name-$n"
-      instance_id=$($CLI_PATH pi instances | grep "$instance_name" | awk '{print $1}')
-      if [[ ! -z $instance_id ]]; then
-        warn "$NODE-$n: Trying to delete the instance that exist on the cloud"
-        $CLI_PATH pi instance-delete $instance_id
-      fi
+    if checkState "module.nodes.ibm_pi_instance.${NODE}[${n}]"; then
+      instance_name="$CLUSTER_ID-$NODE-$n"
+      warn "$NODE-$n: Trying to delete the instance that exist on the cloud"
+      $CLI_PATH pi instance-delete "$instance_name"
     fi
     n=$(( n + 1 ))
   done
@@ -251,8 +387,8 @@ function retry_terraform {
   options=$3
   cmd="$TF $action $options -auto-approve"
 
-  while [[ -f ./tfplan ]] && [[ $(lsof ./tfplan) ]]; do
-    # Multiple plan requests
+  while [[ -f ./tfplan ]] && [[ $(find ./tfplan -mmin -1 -print) ]]; do
+    # Concurrent plan requests will fail; last plan was in less than a min
     sleep $SLEEP_TIME
   done
 
@@ -260,6 +396,7 @@ function retry_terraform {
 
   # Running terraform plan
   $TF plan $vars -input=false > ./tfplan
+  # TODO: If plan does not create new resource then exit
   plan_info
 
   for i in $(seq 1 "$tries"); do
@@ -281,33 +418,30 @@ function retry_terraform {
     monitor_loop
 
     # Check if errors exist
-    mapfile -t errors < <(grep "Error:" "$LOG_FILE" | sort | uniq)
-
-    if [ -z "${errors}" ]; then
-      break
-    else
-      log "${errors[@]}"
+    if grep -c "Error:" "$LOG_FILE" >/dev/null; then
+      log "Encountered below errors:"
+      grep "Error:" "$LOG_FILE" | sort | uniq
 
       # Handle unknown provisioning errors
-      for error in "${errors[@]}"; do
-        if [[ $error == "Error: failed to provision unknown error (status 504)"* ]] || [[ $error == *"invalid name server name already exists for cloud-instance"* ]]; then
-          warn "Unknown issues were seen while provisioning cluster nodes. Verifying if failed nodes were created on the cloud..."
-          if [[ $PERCENT -ge 10 ]]; then
-            # PERCENT>10 means bastion is already created
-            delete_failed_instance bootstrap $BOOTSTRAP_COUNT
-            delete_failed_instance master $MASTER_COUNT
-            delete_failed_instance worker $WORKER_COUNT
-            break
-          fi
+      if grep "failed to provision unknown error (status 504)" "$LOG_FILE" >/dev/null || grep "invalid name server name already exists for cloud-instance" "$LOG_FILE" >/dev/null; then
+        warn "Unknown issues were seen while provisioning cluster nodes. Verifying if failed nodes were created on the cloud..."
+        if [[ $PERCENT -ge 10 ]]; then
+          # PERCENT>10 means bastion is already created
+          delete_failed_instance bootstrap "$BOOTSTRAP_COUNT"
+          delete_failed_instance master "$MASTER_COUNT"
+          delete_failed_instance worker "$WORKER_COUNT"
         fi
-      done
+      fi
+
       # All tries exhausted
-      if [ "$i" == "$tries" ]; then
+      if [[ $i -eq $tries ]]; then
         error "Terraform command failed after $tries attempts! Please check the log files"
       fi
       # Nothing to do other than retry
       warn "Issues were seen while running the terraform command. Attempting to run again..."
       sleep $SLEEP_TIME
+    else
+      break
     fi
   done
   log "Completed running the terraform command."
@@ -363,12 +497,16 @@ function precheck {
     vars="-var-file ../$varfile"
     SERVICE_INSTANCE_ID=$(grep "service_instance_id" $varfile | awk '{print $3}' | sed 's/"//g')
     debug_switch
-    CLOUD_API_KEY=$(grep "ibmcloud_api_key" $varfile | awk '{print $3}' | sed 's/"//g')
+    VAR_CLOUD_API_KEY=$(grep "ibmcloud_api_key" $varfile | awk '{print $3}' | sed 's/"//g')
+    [[ ! -z $VAR_CLOUD_API_KEY ]] && CLOUD_API_KEY=$VAR_CLOUD_API_KEY
     debug_switch
   fi
 
   debug_switch
   # If provided varfile does not have API key read from env
+  if [[ -n $VAR_CLOUD_API_KEY ]]; then
+    CLOUD_API_KEY=$VAR_CLOUD_API_KEY
+  fi
   if [[ -z "${CLOUD_API_KEY}" ]]; then
     error "Please export CLOUD_API_KEY"
   else
@@ -392,6 +530,40 @@ function precheck {
   cd ./"$ARTIFACTS_DIR"
   TF="../$TF"
   CLI_PATH="../$CLI_PATH"
+}
+
+# -------------------------------------------------------------------------
+# Function to read sensitve data by masking with asterisk
+# -------------------------------------------------------------------------
+function read_sensitive_data {
+  stty -echo
+  charcount=0
+  # Empty prompt
+  prompt=''
+  while IFS= read -sp "$prompt" -r -n 1 ch
+  do
+      # Enter - accept password
+      if [[ $ch == $'\0' ]] ; then
+          break
+      fi
+      # Backspace
+      if [[ $ch == $'\177' ]] ; then
+          if [ $charcount -gt 0 ] ; then
+              charcount=$((charcount-1))
+              prompt=$'\b \b'
+              value="${value%?}"
+          else
+              prompt=''
+          fi
+      else
+          charcount=$((charcount+1))
+          prompt='*'
+          value+="$ch"
+      fi
+  done
+  stty echo
+  # New line
+  echo
 }
 
 #-------------------------------------------------------------------------
@@ -419,12 +591,13 @@ function destroy {
 # Display the cluster access information
 #-------------------------------------------------------------------------
 function cluster_access_info {
-  if [[ -f ./terraform.tfstate && $($TF state list | grep "module.install.null_resource.install") != "" ]]; then
-    $($TF output bastion_ssh_command | sed 's/,.*//') -q -o StrictHostKeyChecking=no cat ~/openstack-upi/auth/kubeconfig > ./kubeconfig
+  if [[ -f ./terraform.tfstate ]] && checkState "module.install.null_resource.install"; then
+    # TODO: Find a way to change the bastion user as per TF variable; default is root
     echo "Login to bastion: '$($TF output bastion_ssh_command | sed 's/data/'"$ARTIFACTS_DIR"'\/data/')' and start using the 'oc' command."
+    $($TF output bastion_ssh_command | sed 's/,.*//') -q -o StrictHostKeyChecking=no cat /root/openstack-upi/auth/kubeconfig > ./kubeconfig
     echo "To access the cluster on local system when using 'oc' run: 'export KUBECONFIG=$PWD/kubeconfig'"
     echo "Access the OpenShift web-console here: $($TF output web_console_url)"
-    echo "Login to the console with user: \"kubeadmin\", and password: \"$($($TF output bastion_ssh_command) -q -o StrictHostKeyChecking=no cat ~/openstack-upi/auth/kubeadmin-password)\""
+    echo "Login to the console with user: \"kubeadmin\", and password: \"$($($TF output bastion_ssh_command) -q -o StrictHostKeyChecking=no cat /root/openstack-upi/auth/kubeadmin-password)\""
     [[ $($TF output etc_hosts_entries) ]] && echo "Add the line on local system 'hosts' file: $($TF output etc_hosts_entries)"
     success "Congratulations! create command completed"
   fi
@@ -445,8 +618,9 @@ function question {
 
   if [[ $options == "-sensitive" ]]; then
     log "> $message"
-    read -s value
-    return
+    # read -s value
+    read_sensitive_data
+    return 0
   fi
 
   if [[ $len -gt 1 ]] || [[ -n "$force_select" ]]; then
@@ -487,7 +661,7 @@ function variables_nodes {
       echo "master = {memory = \"16\", processors = \"0.5\", \"count\" = 3}"
       echo "worker = {memory = \"32\", processors = \"0.5\", \"count\" = 2}"
     } >> "$VAR_TEMPLATE"
-    return
+    return 0
   fi
 
   # Bastion node config
@@ -699,7 +873,8 @@ function setup_artifacts() {
 # If latest is available in System PATH then use symlink
 #-------------------------------------------------------------------------
 function setup_terraform {
-  TF_LATEST=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | grep tag_name | cut -d'"' -f4)
+  #TF_LATEST=$(curl -s https://api.github.com/repos/hashicorp/terraform/releases/latest | grep tag_name | cut -d'"' -f4)
+  TF_LATEST="v0.13.5"
   EXT_PATH=$(which terraform 2> /dev/null || true)
 
   if [[ -f $TF && $($TF version | grep 'Terraform v0') == "Terraform ${TF_LATEST}" ]]; then
@@ -715,7 +890,7 @@ function setup_terraform {
     rm -f ./terraform.zip
     chmod +x $TF
   fi
-  $TF version
+  $TF version | head -1
 }
 
 #-------------------------------------------------------------------------
@@ -853,7 +1028,7 @@ function main {
       vars+=" -var $var"
       SERVICE_INSTANCE_ID=$(echo "$var" | grep "service_instance_id" | cut -d '=' -f 2)
       debug_switch
-      CLOUD_API_KEY=$(echo "$var" | grep "ibmcloud_api_key" | cut -d '=' -f 2)
+      VAR_CLOUD_API_KEY=$(echo "$var" | grep "ibmcloud_api_key" | cut -d '=' -f 2)
       debug_switch
       ;;
     "-var-file")
@@ -861,9 +1036,9 @@ function main {
       varfile="$1"
       [[ ! -s "$varfile" ]] && error "File $varfile does not exist"
       vars+=" -var-file ../$varfile"
-      SERVICE_INSTANCE_ID=$(grep "service_instance_id" $varfile | awk '{print $3}' | sed 's/"//g')
+      SERVICE_INSTANCE_ID=$(grep "service_instance_id" "$varfile" | awk '{print $3}' | sed 's/"//g')
       debug_switch
-      CLOUD_API_KEY=$(grep "ibmcloud_api_key" $varfile | awk '{print $3}' | sed 's/"//g')
+      VAR_CLOUD_API_KEY=$(grep "ibmcloud_api_key" "$varfile" | awk '{print $3}' | sed 's/"//g')
       debug_switch
       ;;
     "setup")
