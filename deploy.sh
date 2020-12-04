@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 : '
 Copyright (C) 2020 IBM Corporation
 Licensed under the Apache License, Version 2.0 (the “License”);
@@ -45,8 +45,9 @@ EOF
   exit 0
 }
 
-OCP_RELEASE=${OCP_RELEASE:-"4.5"}
-ARTIFACTS_VERSION=${ARTIFACTS_VERSION:-"release-4.5"}
+RELEASE_VER=${RELEASE_VER:-"4.5"}
+OCP_RELEASE=${OCP_RELEASE:-"$RELEASE_VER"}
+ARTIFACTS_VERSION=${ARTIFACTS_VERSION:-"release-$RELEASE_VER"}
 #ARTIFACTS_VERSION="v4.5.3"
 #ARTIFACTS_VERSION="master"
 
@@ -366,11 +367,12 @@ function is_terraform_running {
 function delete_failed_instance {
   NODE=$1
   COUNT=$2
+  instance_name=""
   n=0
   while [[ "$n" -lt $COUNT ]]; do
-    if checkState "module.nodes.ibm_pi_instance.${NODE}[${n}]"; then
-      instance_name="$CLUSTER_ID-$NODE-$n"
-      warn "$NODE-$n: Trying to delete the instance that exist on the cloud"
+    if ! checkState "module.nodes.ibm_pi_instance.${NODE}[${n}]"; then
+      [[ "$NODE" == "bootstrap" ]] && instance_name="$CLUSTER_ID-$NODE" || instance_name="$CLUSTER_ID-$NODE-$n"
+      warn "$instance_name: Trying to delete the instance that exist on the cloud"
       $CLI_PATH pi instance-delete "$instance_name"
     fi
     n=$(( n + 1 ))
@@ -430,6 +432,8 @@ function retry_terraform {
           delete_failed_instance bootstrap "$BOOTSTRAP_COUNT"
           delete_failed_instance master "$MASTER_COUNT"
           delete_failed_instance worker "$WORKER_COUNT"
+        else
+          delete_failed_instance bastion "$BASTION_COUNT"
         fi
       fi
 
